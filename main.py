@@ -58,15 +58,15 @@ else:
     print("[ENV] No .env file, using system environment")
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("CHAT_ID")
+ADMIN_CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("CHAT_ID")
 MONGO_URI = os.getenv("MONGO_URI")
 
 print("ENV CHECK:",
       "TG_TOKEN", bool(TG_TOKEN),
-      "CHAT_ID", bool(TG_CHAT_ID),
+      "ADMIN_CHAT_ID", bool(ADMIN_CHAT_ID),
       "MONGO_URI", bool(MONGO_URI))
 
-if not all([TG_TOKEN, TG_CHAT_ID, MONGO_URI]):
+if not all([TG_TOKEN, ADMIN_CHAT_ID, MONGO_URI]):
     raise Exception("❌ Missing env variables")
 
 # =====================================================
@@ -81,22 +81,38 @@ MIN_MATCH_SAMPLE = 10
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 # =====================================================
-# 📤 TELEGRAM
+# 📤 TELEGRAM (MULTI-USER SUPPORT)
 # =====================================================
-def tg_send(text):
-    print("[TG] Sending message")
+def tg_send(text, chat_id=None):
+    """Send message to specific chat or all active users"""
+    if chat_id:
+        # Send to specific user
+        _send_to_chat(chat_id, text)
+    else:
+        # Broadcast to all active users
+        active_users = users_col.find({"active": True})
+        for user in active_users:
+            _send_to_chat(user["chat_id"], text)
+
+def _send_to_chat(chat_id, text):
+    """Internal function to send to a single chat"""
     try:
         requests.post(
             f"{TG_API}/sendMessage",
             json={
-                "chat_id": TG_CHAT_ID,
+                "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "Markdown"
             },
             timeout=10
         )
+        print(f"[TG] Message sent to {chat_id}")
     except Exception as e:
-        print("[TG ERROR]", e)
+        print(f"[TG ERROR] {chat_id}: {e}")
+
+def is_admin(chat_id):
+    """Check if user is admin"""
+    return str(chat_id) == str(ADMIN_CHAT_ID)
 
 # =====================================================
 # 🗄️ MONGODB
@@ -104,7 +120,6 @@ def tg_send(text):
 print("[DB] Connecting to MongoDB...")
 try:
     mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    # Test connection
     mongo.admin.command('ping')
     print("[DB] Connected successfully")
 except Exception as e:
@@ -114,10 +129,24 @@ except Exception as e:
 db = mongo["wingo_bot"]
 col = db["results"]
 settings_col = db["settings"]
+users_col = db["users"]
 
 col.create_index([("period", ASCENDING)], unique=True)
-print("[DB] Index ensured")
+users_col.create_index([("chat_id", ASCENDING)], unique=True)
+print("[DB] Indexes ensured")
 
+# Initialize admin user
+if not users_col.find_one({"chat_id": ADMIN_CHAT_ID}):
+    users_col.insert_one({
+        "chat_id": ADMIN_CHAT_ID,
+        "username": "admin",
+        "active": True,
+        "is_admin": True,
+        "added_at": datetime.now(timezone.utc)
+    })
+    print(f"[DB] Admin user added: {ADMIN_CHAT_ID}")
+
+# Default settings
 if not settings_col.find_one({"_id": "global"}):
     settings_col.insert_one({
         "_id": "global",
@@ -218,13 +247,13 @@ def advanced_calc(target, streak_len):
     )
 
     if confidence_score >= 80:
-        confidence = "Very High"
+        confidence = "🔥 Very High"
     elif confidence_score >= 60:
-        confidence = "High"
+        confidence = "💪 High"
     elif confidence_score >= 40:
-        confidence = "Moderate"
+        confidence = "⚖️ Moderate"
     else:
-        confidence = "Weak"
+        confidence = "⚠️ Weak"
 
     print(
         f"[CONF] score={confidence_score} | "
@@ -246,7 +275,7 @@ def advanced_calc(target, streak_len):
     )
 
 # =====================================================
-# 📥 SCRAPER HELPERS (FIXED)
+# 📥 SCRAPER HELPERS
 # =====================================================
 async def bootstrap_history(page):
     """Load history only if DB is empty or has very few records"""
@@ -279,7 +308,6 @@ async def bootstrap_history(page):
             if result not in ("Big", "Small"):
                 continue
 
-            # Check if already exists
             if col.find_one({"period": period}):
                 skipped += 1
                 continue
@@ -292,7 +320,6 @@ async def bootstrap_history(page):
         except Exception as e:
             print(f"[BOOTSTRAP ERROR] Row parse failed: {e}")
 
-    # Insert one by one to handle duplicates gracefully
     for record in records:
         try:
             col.insert_one(record)
@@ -342,49 +369,195 @@ def command_listener():
 
             for u in r.get("result", []):
                 offset = u["update_id"]
-                text = u.get("message", {}).get("text", "")
+                msg = u.get("message", {})
+                text = msg.get("text", "")
+                chat_id = msg.get("chat", {}).get("id")
+                username = msg.get("chat", {}).get("username", "unknown")
 
-                if not text:
+                if not text or not chat_id:
                     continue
 
-                print("[TG CMD]", text)
+                print(f"[TG CMD] {chat_id} ({username}): {text}")
 
-                if text == "/start":
-                    tg_send("🤖 *Wingo Bot Active*\n\n/help - Commands\n/stats - Statistics\n/usersetting - Settings")
+                # Register user automatically on first interaction
+                if not users_col.find_one({"chat_id": str(chat_id)}):
+                    users_col.insert_one({
+                        "chat_id": str(chat_id),
+                        "username": username,
+                        "active": False,  # Must be added by admin
+                        "is_admin": False,
+                        "added_at": datetime.now(timezone.utc)
+                    })
+
+                # ============ ADMIN COMMANDS ============
+                
+                if text.startswith("/adduser") and is_admin(chat_id):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        tg_send("❌ *Usage:* `/adduser {chat_id}`", chat_id)
+                        continue
+                    
+                    target_chat_id = parts[1]
+                    result = users_col.update_one(
+                        {"chat_id": target_chat_id},
+                        {
+                            "$set": {
+                                "active": True,
+                                "added_at": datetime.now(timezone.utc)
+                            }
+                        },
+                        upsert=True
+                    )
+                    
+                    if result.modified_count > 0 or result.upserted_id:
+                        tg_send(
+                            f"✅ *𝗨𝘀𝗲𝗿 𝗔𝗱𝗱𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!*\n\n"
+                            f"👤 Chat ID: `{target_chat_id}`\n"
+                            f"📅 Added: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                            chat_id
+                        )
+                        tg_send(
+                            "🎉 *𝗪𝗲𝗹𝗰𝗼𝗺𝗲 𝘁𝗼 𝗪𝗶𝗻𝗴𝗼 𝗕𝗼𝘁!*\n\n"
+                            "✨ You've been added by admin\n"
+                            "🔔 You'll now receive streak alerts\n\n"
+                            "Type /help to see commands",
+                            target_chat_id
+                        )
+                    else:
+                        tg_send("⚠️ *User already active*", chat_id)
+
+                elif text.startswith("/removeuser") and is_admin(chat_id):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        tg_send("❌ *Usage:* `/removeuser {chat_id}`", chat_id)
+                        continue
+                    
+                    target_chat_id = parts[1]
+                    users_col.update_one(
+                        {"chat_id": target_chat_id},
+                        {"$set": {"active": False}}
+                    )
+                    tg_send(
+                        f"🚫 *𝗨𝘀𝗲𝗿 𝗥𝗲𝗺𝗼𝘃𝗲𝗱*\n\n"
+                        f"👤 Chat ID: `{target_chat_id}`",
+                        chat_id
+                    )
+                    tg_send(
+                        "👋 *You've been removed from alerts*\n\n"
+                        "Contact admin to be re-added",
+                        target_chat_id
+                    )
+
+                elif text == "/listusers" and is_admin(chat_id):
+                    users = list(users_col.find({"active": True}))
+                    if not users:
+                        tg_send("📭 *No active users*", chat_id)
+                    else:
+                        msg = "👥 *𝗔𝗖𝗧𝗜𝗩𝗘 𝗨𝗦𝗘𝗥𝗦*\n\n"
+                        for i, user in enumerate(users, 1):
+                            admin_badge = " 👑" if user.get("is_admin") else ""
+                            msg += f"{i}. `{user['chat_id']}`{admin_badge}\n"
+                            msg += f"   └ @{user.get('username', 'unknown')}\n\n"
+                        msg += f"📊 Total: *{len(users)} users*"
+                        tg_send(msg, chat_id)
+
+                # ============ USER COMMANDS ============
+                
+                elif text == "/start":
+                    user = users_col.find_one({"chat_id": str(chat_id)})
+                    if user and user.get("active"):
+                        tg_send(
+                            "🎰 *𝗪𝗜𝗡𝗚𝗢 𝗕𝗢𝗧* 🎰\n\n"
+                            "✅ You're subscribed to alerts!\n\n"
+                            "📋 /help - View commands\n"
+                            "📊 /stats - View statistics\n"
+                            "⚙️ /settings - Bot settings",
+                            chat_id
+                        )
+                    else:
+                        tg_send(
+                            "🎰 *𝗪𝗜𝗡𝗚𝗢 𝗕𝗢𝗧* 🎰\n\n"
+                            "⚠️ You're not authorized yet\n"
+                            "📩 Contact admin to get access\n\n"
+                            f"Your Chat ID: `{chat_id}`",
+                            chat_id
+                        )
 
                 elif text == "/help":
-                    tg_send(
-                        "📋 *Available Commands:*\n\n"
-                        "/stats - View records\n"
-                        "/usersetting - View settings\n"
-                        "/alerts on|off - Toggle alerts\n"
-                        "/probability on|off - Toggle probability"
+                    user = users_col.find_one({"chat_id": str(chat_id)})
+                    msg = (
+                        "📚 *𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦*\n\n"
+                        "📊 /stats - Database statistics\n"
+                        "⚙️ /settings - View settings\n"
+                        "🔔 /alerts on|off - Toggle alerts\n"
+                        "📈 /probability on|off - Toggle probability\n"
+                        "ℹ️ /mychatid - Get your chat ID"
                     )
+                    if is_admin(chat_id):
+                        msg += (
+                            "\n\n👑 *𝗔𝗗𝗠𝗜𝗡 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦*\n\n"
+                            "➕ /adduser {chat_id}\n"
+                            "➖ /removeuser {chat_id}\n"
+                            "👥 /listusers"
+                        )
+                    tg_send(msg, chat_id)
 
                 elif text == "/stats":
                     count = col.count_documents({})
-                    tg_send(f"📊 *Database Records:* {count}")
+                    total_users = users_col.count_documents({"active": True})
+                    tg_send(
+                        f"📊 *𝗗𝗔𝗧𝗔𝗕𝗔𝗦𝗘 𝗦𝗧𝗔𝗧𝗦*\n\n"
+                        f"🎲 Total Records: *{count}*\n"
+                        f"👥 Active Users: *{total_users}*\n"
+                        f"🤖 Status: *Online*",
+                        chat_id
+                    )
 
-                elif text == "/usersetting":
+                elif text == "/settings" or text == "/usersetting":
                     s = get_settings()
                     tg_send(
-                        f"⚙️ *CURRENT SETTINGS*\n\n"
-                        f"🔔 Alerts: *{'ON' if s['alerts'] else 'OFF'}*\n"
-                        f"📊 Probability: *{'ON' if s['probability'] else 'OFF'}*"
+                        f"⚙️ *𝗖𝗨𝗥𝗥𝗘𝗡𝗧 𝗦𝗘𝗧𝗧𝗜𝗡𝗚𝗦*\n\n"
+                        f"🔔 Alerts: *{'✅ ON' if s['alerts'] else '❌ OFF'}*\n"
+                        f"📈 Probability: *{'✅ ON' if s['probability'] else '❌ OFF'}*",
+                        chat_id
+                    )
+
+                elif text == "/mychatid":
+                    tg_send(
+                        f"🆔 *𝗬𝗢𝗨𝗥 𝗖𝗛𝗔𝗧 𝗜𝗗*\n\n"
+                        f"`{chat_id}`\n\n"
+                        f"📋 Tap to copy",
+                        chat_id
                     )
 
                 elif text.startswith("/alerts"):
+                    if not is_admin(chat_id):
+                        tg_send("⛔ *Admin only command*", chat_id)
+                        continue
+                    
                     val = "on" in text.lower()
                     settings_col.update_one({"_id": "global"}, {"$set": {"alerts": val}})
-                    tg_send(f"🔔 Alerts: *{'ON' if val else 'OFF'}*")
+                    tg_send(
+                        f"🔔 *𝗔𝗟𝗘𝗥𝗧𝗦*\n\n"
+                        f"Status: *{'✅ ENABLED' if val else '❌ DISABLED'}*",
+                        chat_id
+                    )
 
                 elif text.startswith("/probability"):
+                    if not is_admin(chat_id):
+                        tg_send("⛔ *Admin only command*", chat_id)
+                        continue
+                    
                     val = "on" in text.lower()
                     settings_col.update_one({"_id": "global"}, {"$set": {"probability": val}})
-                    tg_send(f"📊 Probability: *{'ON' if val else 'OFF'}*")
+                    tg_send(
+                        f"📈 *𝗣𝗥𝗢𝗕𝗔𝗕𝗜𝗟𝗜𝗧𝗬*\n\n"
+                        f"Status: *{'✅ ENABLED' if val else '❌ DISABLED'}*",
+                        chat_id
+                    )
 
         except Exception as e:
-            print("[TG CMD ERROR]", e)
+            print(f"[TG CMD ERROR] {e}")
 
         time.sleep(2)
 
@@ -408,12 +581,10 @@ async def monitor(page):
 
             period, side = res
             
-            # Check if already exists
             if col.find_one({"period": period}):
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # Insert new record
             try:
                 col.insert_one({
                     "period": period,
@@ -434,9 +605,10 @@ async def monitor(page):
             else:
                 if current_streak >= 3:
                     tg_send(
-                        f"❌ *Streak Broken*\n\n"
-                        f"Previous: *{current_streak}x {current_side.upper()}*\n"
-                        f"New: *{side.upper()}*"
+                        f"💔 *𝗦𝗧𝗥𝗘𝗔𝗞 𝗕𝗥𝗢𝗞𝗘𝗡*\n\n"
+                        f"{'🔴' if current_side == 'Big' else '🔵'} Previous: *{current_streak}x {current_side.upper()}*\n"
+                        f"{'🔵' if side == 'Small' else '🔴'} New: *{side.upper()}*\n\n"
+                        f"⏱️ {datetime.now().strftime('%H:%M:%S')}"
                     )
 
                 current_side = side
@@ -449,9 +621,15 @@ async def monitor(page):
                 current_streak > last_alerted_streak and 
                 settings["alerts"]):
                 
+                emoji = "🔴" if current_side == "Big" else "🔵"
+                fire = "🔥" * min(current_streak, 5)
+                
                 msg = (
-                    f"🔥 *{current_streak}x {current_side.upper()} STREAK* 🔥\n\n"
-                    f"📊 Database: *{total} rounds*"
+                    f"{fire} *𝗦𝗧𝗥𝗘𝗔𝗞 𝗔𝗟𝗘𝗥𝗧* {fire}\n\n"
+                    f"{emoji} *{current_streak}x {current_side.upper()}* {emoji}\n\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"📊 Database: *{total} rounds*\n"
+                    f"⏱️ Time: *{datetime.now().strftime('%H:%M:%S')}*"
                 )
 
                 if settings["probability"]:
@@ -460,13 +638,23 @@ async def monitor(page):
                         cont, brk, pressure, conf, score, matched, continued, _ = calc
                         broken = matched - continued
 
+                        # Progress bar for continue/break
+                        cont_bars = int(cont / 10)
+                        brk_bars = int(brk / 10)
+                        cont_visual = "█" * cont_bars + "░" * (10 - cont_bars)
+                        brk_visual = "█" * brk_bars + "░" * (10 - brk_bars)
+
                         msg += (
-                            f"\n\n*📈 Probability Analysis:*\n"
-                            f"Continue: *{cont}%*\n"
-                            f"Break: *{brk}%*\n"
-                            f"Pressure: *{pressure}×*\n"
-                            f"Confidence: *{conf}* ({score}/100)\n"
-                            f"Sample: *{matched}* ({continued}✓ / {broken}✗)"
+                            f"\n\n📈 *𝗣𝗥𝗢𝗕𝗔𝗕𝗜𝗟𝗜𝗧𝗬 𝗔𝗡𝗔𝗟𝗬𝗦𝗜𝗦*\n"
+                            f"━━━━━━━━━━━━━━━━\n"
+                            f"✅ Continue: *{cont}%*\n"
+                            f"   {cont_visual}\n\n"
+                            f"❌ Break: *{brk}%*\n"
+                            f"   {brk_visual}\n\n"
+                            f"⚡ Pressure: *{pressure}×*\n"
+                            f"🎯 Confidence: *{conf}*\n"
+                            f"📊 Sample: *{matched}* (✓{continued} / ✗{broken})\n"
+                            f"💯 Score: *{score}/100*"
                         )
 
                 tg_send(msg)
@@ -475,7 +663,7 @@ async def monitor(page):
             await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            print("[MONITOR ERROR]", e)
+            print(f"[MONITOR ERROR] {e}")
             bot_status["running"] = False
             await asyncio.sleep(10)
             bot_status["running"] = True
@@ -484,16 +672,20 @@ async def monitor(page):
 # ▶ RUN
 # =====================================================
 async def main():
-    # Start Flask FIRST
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Wait for Flask to start
     await asyncio.sleep(2)
     print("[FLASK] Health server running")
 
     try:
-        tg_send("🚀 *Wingo Bot Started*")
+        tg_send(
+            "🚀 *𝗪𝗜𝗡𝗚𝗢 𝗕𝗢𝗧 𝗦𝗧𝗔𝗥𝗧𝗘𝗗* 🚀\n\n"
+            "✨ System online and monitoring\n"
+            "🔔 Alerts enabled\n"
+            "📊 Database connected\n\n"
+            f"⏱️ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
     except Exception as e:
         print(f"[TG] Initial message failed: {e}")
 
