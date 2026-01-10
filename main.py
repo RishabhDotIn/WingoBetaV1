@@ -2,33 +2,35 @@ import os
 import asyncio
 import time
 import requests
-import threading
-import certifi 
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Thread
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async  # 🟢 NEW: Anti-Detect Library
+from flask import Flask
 
 # =====================================================
-# 🌐 RENDER PORT FIX (Required so Render doesn't kill the bot)
+# 🌐 HEALTH CHECK SERVER (FOR RENDER)
 # =====================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot Running in Stealth Mode")
-    def log_message(self, format, *args): return
+app = Flask(__name__)
 
-def run_health_check():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+@app.route('/')
+def health():
+    return {"status": "healthy", "service": "wingo-bot"}, 200
 
-threading.Thread(target=run_health_check, daemon=True).start()
+@app.route('/stats')
+def stats():
+    try:
+        count = col.count_documents({})
+        return {"records": count, "status": "running"}, 200
+    except:
+        return {"error": "db_not_ready"}, 503
+
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # =====================================================
 # 🔐 ENV LOADING
@@ -41,12 +43,17 @@ ENV_PATH = BASE_DIR / ".env"
 if ENV_PATH.exists():
     load_dotenv(dotenv_path=ENV_PATH)
     print("[ENV] .env loaded")
+else:
+    print("[ENV] No .env file, using system environment")
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("CHAT_ID")
 MONGO_URI = os.getenv("MONGO_URI")
 
-print("ENV CHECK:", "TG_TOKEN", bool(TG_TOKEN), "CHAT_ID", bool(TG_CHAT_ID), "MONGO_URI", bool(MONGO_URI))
+print("ENV CHECK:",
+      "TG_TOKEN", bool(TG_TOKEN),
+      "CHAT_ID", bool(TG_CHAT_ID),
+      "MONGO_URI", bool(MONGO_URI))
 
 if not all([TG_TOKEN, TG_CHAT_ID, MONGO_URI]):
     raise Exception("❌ Missing env variables")
@@ -70,17 +77,21 @@ def tg_send(text):
     try:
         requests.post(
             f"{TG_API}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={
+                "chat_id": TG_CHAT_ID,
+                "text": text,
+                "parse_mode": "Markdown"
+            },
             timeout=10
         )
     except Exception as e:
         print("[TG ERROR]", e)
 
 # =====================================================
-# 🗄️ MONGODB (SSL FIX ADDED)
+# 🗄️ MONGODB
 # =====================================================
 print("[DB] Connecting to MongoDB...")
-mongo = MongoClient(MONGO_URI, tlsCAFile=certifi.where()) # 🟢 FIXED: SSL Handshake
+mongo = MongoClient(MONGO_URI)
 db = mongo["wingo_bot"]
 col = db["results"]
 settings_col = db["settings"]
@@ -89,7 +100,11 @@ col.create_index([("period", ASCENDING)], unique=True)
 print("[DB] Index ensured")
 
 if not settings_col.find_one({"_id": "global"}):
-    settings_col.insert_one({"_id": "global", "alerts": True, "probability": True})
+    settings_col.insert_one({
+        "_id": "global",
+        "alerts": True,
+        "probability": True
+    })
     print("[DB] Default settings inserted")
 
 def get_settings():
@@ -116,7 +131,8 @@ def advanced_calc(target, streak_len):
 
     print(f"[PROB] Calculating for {streak_len}x {target}, data={total}")
 
-    if total < MIN_DATA_FOR_CALC: return None
+    if total < MIN_DATA_FOR_CALC:
+        return None
 
     matched = 0
     continued = 0
@@ -128,7 +144,8 @@ def advanced_calc(target, streak_len):
             if i + streak_len < len(results) and results[i + streak_len] == target:
                 continued += 1
 
-    if matched == 0: return None
+    if matched == 0:
+        return None
 
     cont_pct = (continued / matched) * 100
     brk_pct = 100 - cont_pct
@@ -137,7 +154,8 @@ def advanced_calc(target, streak_len):
     cur = results[0]
     cnt = 1
     for x in results[1:]:
-        if x == cur: cnt += 1
+        if x == cur:
+            cnt += 1
         else:
             streaks.append(cnt)
             cur = x
@@ -147,13 +165,18 @@ def advanced_calc(target, streak_len):
     avg_streak = sum(streaks) / len(streaks)
     pressure = streak_len / avg_streak if avg_streak else 1
 
+    # Advanced confidence scoring
     sample_strength = min(matched / 30, 1) * 30
     bias_strength = abs(cont_pct - 50) * 0.6
 
-    if pressure < 0.8: pressure_score = 20
-    elif pressure < 1.1: pressure_score = 15
-    elif pressure < 1.4: pressure_score = 10
-    else: pressure_score = 5
+    if pressure < 0.8:
+        pressure_score = 20
+    elif pressure < 1.1:
+        pressure_score = 15
+    elif pressure < 1.4:
+        pressure_score = 10
+    else:
+        pressure_score = 5
 
     recent_slice = results[int(total * 0.7):]
     recent_matches = 0
@@ -169,65 +192,96 @@ def advanced_calc(target, streak_len):
     if recent_matches > 0:
         recent_bias = abs((recent_continues / recent_matches) * 100 - 50)
         recency_score = min(recent_bias * 0.4, 20)
-    else: recency_score = 5
+    else:
+        recency_score = 5
 
-    confidence_score = round(sample_strength + bias_strength + pressure_score + recency_score, 1)
+    confidence_score = round(
+        sample_strength + bias_strength + pressure_score + recency_score, 1
+    )
 
-    if confidence_score >= 80: confidence = "Very High"
-    elif confidence_score >= 60: confidence = "High"
-    elif confidence_score >= 40: confidence = "Moderate"
-    else: confidence = "Weak"
+    if confidence_score >= 80:
+        confidence = "Very High"
+    elif confidence_score >= 60:
+        confidence = "High"
+    elif confidence_score >= 40:
+        confidence = "Moderate"
+    else:
+        confidence = "Weak"
 
-    print(f"[CONF] score={confidence_score}")
+    print(
+        f"[CONF] score={confidence_score} | "
+        f"sample={sample_strength:.1f} "
+        f"bias={bias_strength:.1f} "
+        f"pressure={pressure_score} "
+        f"recency={recency_score:.1f}"
+    )
 
-    return (round(cont_pct, 2), round(brk_pct, 2), round(pressure, 2), confidence, confidence_score, matched, continued, total)
+    return (
+        round(cont_pct, 2),
+        round(brk_pct, 2),
+        round(pressure, 2),
+        confidence,
+        confidence_score,
+        matched,
+        continued,
+        total
+    )
 
 # =====================================================
 # 📥 SCRAPER HELPERS
 # =====================================================
 async def bootstrap_history(page):
     print("[BOOTSTRAP] Clearing DB and loading history...")
-    col.delete_many({}) # Force Clear
+    col.delete_many({})
 
-    # 🟢 NEW: Robust Selector & Scroll to trigger load
-    await page.mouse.wheel(0, 1000)
-    await asyncio.sleep(2)
-    
-    rows = await page.query_selector_all("div[style*='display: flex']")
-    print(f"[BOOTSTRAP] Found {len(rows)} potential rows")
+    rows = await page.query_selector_all(
+        "div[style*='display: flex'][style*='row']"
+    )
 
     records = []
+
     for r in rows:
         text = await r.inner_text()
         parts = [p.strip() for p in text.split("\n") if p.strip()]
-        # 🟢 NEW: Flexible matching
-        if len(parts) >= 3 and ("Big" in parts or "Small" in parts):
-            period = parts[0].replace("*", "")
-            result = "Big" if "Big" in parts else "Small"
-            
-            # Avoid duplicates
-            if not any(x['period'] == period for x in records):
-                records.append({
-                    "period": period,
-                    "result": result,
-                    "timestamp": datetime.now(timezone.utc)
-                })
+        if len(parts) < 3:
+            continue
+
+        period = parts[0].replace("*", "")
+        result = parts[2]
+
+        if result not in ("Big", "Small"):
+            continue
+
+        records.append({
+            "period": period,
+            "result": result,
+            "timestamp": datetime.now(timezone.utc)
+        })
 
     records.sort(key=lambda x: x["period"])
     if records:
         col.insert_many(records)
-        print(f"[BOOTSTRAP] Loaded {len(records)} records")
-    else:
-        print("[BOOTSTRAP ERROR] No records found! Stealth mode might need adjustment.")
+
+    print(f"[BOOTSTRAP] Loaded {len(records)} records")
 
 async def extract_latest(page):
-    rows = await page.query_selector_all("div[style*='display: flex']")
+    rows = await page.query_selector_all(
+        "div[style*='display: flex'][style*='row']"
+    )
+
     for r in rows:
         text = await r.inner_text()
         parts = [p.strip() for p in text.split("\n") if p.strip()]
-        if len(parts) >= 3 and ("Big" in parts or "Small" in parts):
-            result = "Big" if "Big" in parts else "Small"
-            return parts[0].replace("*", ""), result
+        if len(parts) < 3:
+            continue
+
+        period = parts[0].replace("*", "")
+        result = parts[2]
+
+        if result in ("Big", "Small"):
+            print(f"[SCRAPER] Latest found {period} | {result}")
+            return period, result
+
     return None
 
 # =====================================================
@@ -238,34 +292,54 @@ def command_listener():
     offset = 0
     while True:
         try:
-            r = requests.get(f"{TG_API}/getUpdates", params={"offset": offset + 1, "timeout": 30}).json()
+            r = requests.get(
+                f"{TG_API}/getUpdates",
+                params={"offset": offset + 1, "timeout": 30}
+            ).json()
+
             for u in r.get("result", []):
                 offset = u["update_id"]
                 text = u.get("message", {}).get("text", "")
-                
-                if text == "/start": tg_send("🤖 *Wingo Bot Started*\n/help\n/stats\n/usersetting")
-                elif text == "/help": tg_send("/stats\n/usersetting\n/alerts on|off\n/probability on|off")
-                elif text == "/stats": tg_send(f"📊 Records: *{col.count_documents({})}*")
+                print("[TG CMD]", text)
+
+                if text == "/start":
+                    tg_send("🤖 *Wingo Bot Started*\n/help\n/stats\n/usersetting")
+
+                elif text == "/help":
+                    tg_send("/stats\n/usersetting\n/alerts on|off\n/probability on|off")
+
+                elif text == "/stats":
+                    tg_send(f"📊 Records: *{col.count_documents({})}*")
+
                 elif text == "/usersetting":
                     s = get_settings()
-                    tg_send(f"⚙️ *SETTINGS*\nAlerts: {'ON' if s['alerts'] else 'OFF'}\nProbability: {'ON' if s['probability'] else 'OFF'}")
+                    tg_send(
+                        f"⚙️ *SETTINGS*\n"
+                        f"Alerts: {'ON' if s['alerts'] else 'OFF'}\n"
+                        f"Probability: {'ON' if s['probability'] else 'OFF'}"
+                    )
+
                 elif text.startswith("/alerts"):
                     val = "on" in text
                     settings_col.update_one({"_id": "global"}, {"$set": {"alerts": val}})
                     tg_send(f"🔔 Alerts {'ON' if val else 'OFF'}")
+
                 elif text.startswith("/probability"):
                     val = "on" in text
                     settings_col.update_one({"_id": "global"}, {"$set": {"probability": val}})
                     tg_send(f"📊 Probability {'ON' if val else 'OFF'}")
+
         except Exception as e:
             print("[TG CMD ERROR]", e)
+
         time.sleep(2)
 
 # =====================================================
-# 🚀 MAIN MONITOR (STEALTH ENABLED)
+# 🚀 MAIN MONITOR
 # =====================================================
 async def monitor(page):
     print("[MONITOR] Starting monitor loop")
+
     current_side = None
     current_streak = 0
     last_alerted_streak = 0
@@ -287,6 +361,7 @@ async def monitor(page):
                 "result": side,
                 "timestamp": datetime.now(timezone.utc)
             })
+
             trim_db()
             print(f"[DATA] {period} | {side}")
 
@@ -294,8 +369,12 @@ async def monitor(page):
                 current_streak += 1
             else:
                 if current_streak >= 3:
-                    tg_send(f"❌ *Streak broken*\nLast streak: *{current_streak}x {current_side.upper()}*")
-                    print(f"[STREAK] Break: {current_streak}x {current_side}")
+                    tg_send(
+                        f"❌ *Streak broken*\n\n"
+                        f"Last streak: *{current_streak}x {current_side.upper()}*"
+                    )
+                    print(f"[STREAK] Break notified: {current_streak}x {current_side}")
+
                 current_side = side
                 current_streak = 1
 
@@ -303,18 +382,30 @@ async def monitor(page):
             total = col.count_documents({})
 
             if (current_streak >= 3 and current_streak > last_alerted_streak and settings["alerts"]):
-                msg = f"🔥🔥 *{current_streak}x {current_side.upper()} IN A ROW* 🔥🔥\n📊 History size: *{total} rounds*"
+                msg = (
+                    f"🔥🔥 *{current_streak}x {current_side.upper()} IN A ROW* 🔥🔥\n\n"
+                    f"📊 History size: *{total} rounds*"
+                )
+
                 if settings["probability"]:
                     calc = advanced_calc(current_side, current_streak)
                     if calc:
-                        cont, brk, pressure, conf, _, matched, continued, total = calc
+                        cont, brk, pressure, conf, score, matched, continued, total_calc = calc
                         broken = matched - continued
-                        msg += (f"\n\n➡️ Continue: *{cont}%*\n➡️ Break: *{brk}%*\n📈 Pressure: *{pressure}×*\n"
-                                f"🎯 Confidence: *{conf}*\n📊 Samples: *{matched}* ({continued}C : {broken}B)")
+
+                        msg += (
+                            f"\n\n➡️ Continue: *{cont}%*\n"
+                            f"➡️ Break: *{brk}%*\n"
+                            f"📈 Pressure: *{pressure}×*\n"
+                            f"🎯 Confidence: *{conf}*\n"
+                            f"📊 Samples: *{matched}* ({continued} continue : {broken} break)"
+                        )
+
                 tg_send(msg)
                 last_alerted_streak = current_streak
 
             await asyncio.sleep(CHECK_INTERVAL)
+
         except Exception as e:
             print("[MONITOR ERROR]", e)
             await asyncio.sleep(5)
@@ -323,33 +414,21 @@ async def monitor(page):
 # ▶ RUN
 # =====================================================
 async def main():
+    # Start Flask health check server
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"[FLASK] Health check server started on port {os.getenv('PORT', 10000)}")
+
     tg_send("🚀 *Wingo Bot Started & Monitoring Live*")
 
     async with async_playwright() as p:
-        # 🟢 NEW: Anti-Detect Flags
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox"
-            ]
-        )
-        
-        # 🟢 NEW: Real User Agent Context
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        )
-        
-        page = await context.new_page()
-        
-        # 🟢 NEW: Inject Stealth Scripts
-        await stealth_async(page)
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
 
-        print("[SCRAPER] Opening page with Stealth...")
+        print("[SCRAPER] Opening page...")
         await page.goto(WINGO_URL, timeout=60000, wait_until="domcontentloaded")
-        await asyncio.sleep(5) # Allow JS to load
-        
+        await page.wait_for_timeout(8000)
+
         await bootstrap_history(page)
 
         await asyncio.gather(
