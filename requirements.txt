@@ -5,3 +5,4 @@ greenlet<3.1
 playwright==1.44.0
 certifi
 playwright-stealth
+flask==3.1.0
