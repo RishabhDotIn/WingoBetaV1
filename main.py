@@ -8,6 +8,7 @@ from threading import Thread
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
 from playwright.async_api import async_playwright
 from flask import Flask
 
@@ -15,21 +16,31 @@ from flask import Flask
 # 🌐 HEALTH CHECK SERVER (FOR RENDER)
 # =====================================================
 app = Flask(__name__)
+bot_status = {"running": False, "last_update": None, "records": 0}
 
 @app.route('/')
+@app.route('/health')
 def health():
-    return {"status": "healthy", "service": "wingo-bot"}, 200
+    return {
+        "status": "healthy",
+        "service": "wingo-bot",
+        "bot_running": bot_status["running"],
+        "last_update": str(bot_status.get("last_update", "N/A")),
+        "records": bot_status.get("records", 0)
+    }, 200
 
 @app.route('/stats')
 def stats():
     try:
         count = col.count_documents({})
+        bot_status["records"] = count
         return {"records": count, "status": "running"}, 200
-    except:
-        return {"error": "db_not_ready"}, 503
+    except Exception as e:
+        return {"error": str(e)}, 503
 
 def run_flask():
     port = int(os.getenv("PORT", 10000))
+    print(f"[FLASK] Starting on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # =====================================================
@@ -91,7 +102,15 @@ def tg_send(text):
 # 🗄️ MONGODB
 # =====================================================
 print("[DB] Connecting to MongoDB...")
-mongo = MongoClient(MONGO_URI)
+try:
+    mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    # Test connection
+    mongo.admin.command('ping')
+    print("[DB] Connected successfully")
+except Exception as e:
+    print(f"[DB ERROR] Failed to connect: {e}")
+    raise
+
 db = mongo["wingo_bot"]
 col = db["results"]
 settings_col = db["settings"]
@@ -165,7 +184,6 @@ def advanced_calc(target, streak_len):
     avg_streak = sum(streaks) / len(streaks)
     pressure = streak_len / avg_streak if avg_streak else 1
 
-    # Advanced confidence scoring
     sample_strength = min(matched / 30, 1) * 30
     bias_strength = abs(cont_pct - 50) * 0.6
 
@@ -228,41 +246,62 @@ def advanced_calc(target, streak_len):
     )
 
 # =====================================================
-# 📥 SCRAPER HELPERS
+# 📥 SCRAPER HELPERS (FIXED)
 # =====================================================
 async def bootstrap_history(page):
-    print("[BOOTSTRAP] Clearing DB and loading history...")
-    col.delete_many({})
+    """Load history only if DB is empty or has very few records"""
+    existing_count = col.count_documents({})
+    
+    if existing_count >= 50:
+        print(f"[BOOTSTRAP] Skipping - DB already has {existing_count} records")
+        return
+    
+    print("[BOOTSTRAP] Loading history from page...")
 
     rows = await page.query_selector_all(
         "div[style*='display: flex'][style*='row']"
     )
 
     records = []
+    inserted = 0
+    skipped = 0
 
     for r in rows:
-        text = await r.inner_text()
-        parts = [p.strip() for p in text.split("\n") if p.strip()]
-        if len(parts) < 3:
+        try:
+            text = await r.inner_text()
+            parts = [p.strip() for p in text.split("\n") if p.strip()]
+            if len(parts) < 3:
+                continue
+
+            period = parts[0].replace("*", "")
+            result = parts[2]
+
+            if result not in ("Big", "Small"):
+                continue
+
+            # Check if already exists
+            if col.find_one({"period": period}):
+                skipped += 1
+                continue
+
+            records.append({
+                "period": period,
+                "result": result,
+                "timestamp": datetime.now(timezone.utc)
+            })
+        except Exception as e:
+            print(f"[BOOTSTRAP ERROR] Row parse failed: {e}")
+
+    # Insert one by one to handle duplicates gracefully
+    for record in records:
+        try:
+            col.insert_one(record)
+            inserted += 1
+        except DuplicateKeyError:
+            skipped += 1
             continue
 
-        period = parts[0].replace("*", "")
-        result = parts[2]
-
-        if result not in ("Big", "Small"):
-            continue
-
-        records.append({
-            "period": period,
-            "result": result,
-            "timestamp": datetime.now(timezone.utc)
-        })
-
-    records.sort(key=lambda x: x["period"])
-    if records:
-        col.insert_many(records)
-
-    print(f"[BOOTSTRAP] Loaded {len(records)} records")
+    print(f"[BOOTSTRAP] Complete: {inserted} inserted, {skipped} skipped")
 
 async def extract_latest(page):
     rows = await page.query_selector_all(
@@ -270,17 +309,20 @@ async def extract_latest(page):
     )
 
     for r in rows:
-        text = await r.inner_text()
-        parts = [p.strip() for p in text.split("\n") if p.strip()]
-        if len(parts) < 3:
+        try:
+            text = await r.inner_text()
+            parts = [p.strip() for p in text.split("\n") if p.strip()]
+            if len(parts) < 3:
+                continue
+
+            period = parts[0].replace("*", "")
+            result = parts[2]
+
+            if result in ("Big", "Small"):
+                return period, result
+        except Exception as e:
+            print(f"[SCRAPER ERROR] {e}")
             continue
-
-        period = parts[0].replace("*", "")
-        result = parts[2]
-
-        if result in ("Big", "Small"):
-            print(f"[SCRAPER] Latest found {period} | {result}")
-            return period, result
 
     return None
 
@@ -294,40 +336,52 @@ def command_listener():
         try:
             r = requests.get(
                 f"{TG_API}/getUpdates",
-                params={"offset": offset + 1, "timeout": 30}
+                params={"offset": offset + 1, "timeout": 30},
+                timeout=35
             ).json()
 
             for u in r.get("result", []):
                 offset = u["update_id"]
                 text = u.get("message", {}).get("text", "")
+
+                if not text:
+                    continue
+
                 print("[TG CMD]", text)
 
                 if text == "/start":
-                    tg_send("🤖 *Wingo Bot Started*\n/help\n/stats\n/usersetting")
+                    tg_send("🤖 *Wingo Bot Active*\n\n/help - Commands\n/stats - Statistics\n/usersetting - Settings")
 
                 elif text == "/help":
-                    tg_send("/stats\n/usersetting\n/alerts on|off\n/probability on|off")
+                    tg_send(
+                        "📋 *Available Commands:*\n\n"
+                        "/stats - View records\n"
+                        "/usersetting - View settings\n"
+                        "/alerts on|off - Toggle alerts\n"
+                        "/probability on|off - Toggle probability"
+                    )
 
                 elif text == "/stats":
-                    tg_send(f"📊 Records: *{col.count_documents({})}*")
+                    count = col.count_documents({})
+                    tg_send(f"📊 *Database Records:* {count}")
 
                 elif text == "/usersetting":
                     s = get_settings()
                     tg_send(
-                        f"⚙️ *SETTINGS*\n"
-                        f"Alerts: {'ON' if s['alerts'] else 'OFF'}\n"
-                        f"Probability: {'ON' if s['probability'] else 'OFF'}"
+                        f"⚙️ *CURRENT SETTINGS*\n\n"
+                        f"🔔 Alerts: *{'ON' if s['alerts'] else 'OFF'}*\n"
+                        f"📊 Probability: *{'ON' if s['probability'] else 'OFF'}*"
                     )
 
                 elif text.startswith("/alerts"):
-                    val = "on" in text
+                    val = "on" in text.lower()
                     settings_col.update_one({"_id": "global"}, {"$set": {"alerts": val}})
-                    tg_send(f"🔔 Alerts {'ON' if val else 'OFF'}")
+                    tg_send(f"🔔 Alerts: *{'ON' if val else 'OFF'}*")
 
                 elif text.startswith("/probability"):
-                    val = "on" in text
+                    val = "on" in text.lower()
                     settings_col.update_one({"_id": "global"}, {"$set": {"probability": val}})
-                    tg_send(f"📊 Probability {'ON' if val else 'OFF'}")
+                    tg_send(f"📊 Probability: *{'ON' if val else 'OFF'}*")
 
         except Exception as e:
             print("[TG CMD ERROR]", e)
@@ -339,6 +393,7 @@ def command_listener():
 # =====================================================
 async def monitor(page):
     print("[MONITOR] Starting monitor loop")
+    bot_status["running"] = True
 
     current_side = None
     current_streak = 0
@@ -352,28 +407,37 @@ async def monitor(page):
                 continue
 
             period, side = res
+            
+            # Check if already exists
             if col.find_one({"period": period}):
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            col.insert_one({
-                "period": period,
-                "result": side,
-                "timestamp": datetime.now(timezone.utc)
-            })
+            # Insert new record
+            try:
+                col.insert_one({
+                    "period": period,
+                    "result": side,
+                    "timestamp": datetime.now(timezone.utc)
+                })
+                bot_status["last_update"] = datetime.now(timezone.utc)
+                print(f"[DATA] {period} | {side}")
+            except DuplicateKeyError:
+                print(f"[DATA] Duplicate skipped: {period}")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
 
             trim_db()
-            print(f"[DATA] {period} | {side}")
 
             if side == current_side:
                 current_streak += 1
             else:
                 if current_streak >= 3:
                     tg_send(
-                        f"❌ *Streak broken*\n\n"
-                        f"Last streak: *{current_streak}x {current_side.upper()}*"
+                        f"❌ *Streak Broken*\n\n"
+                        f"Previous: *{current_streak}x {current_side.upper()}*\n"
+                        f"New: *{side.upper()}*"
                     )
-                    print(f"[STREAK] Break notified: {current_streak}x {current_side}")
 
                 current_side = side
                 current_streak = 1
@@ -381,24 +445,28 @@ async def monitor(page):
             settings = get_settings()
             total = col.count_documents({})
 
-            if (current_streak >= 3 and current_streak > last_alerted_streak and settings["alerts"]):
+            if (current_streak >= 3 and 
+                current_streak > last_alerted_streak and 
+                settings["alerts"]):
+                
                 msg = (
-                    f"🔥🔥 *{current_streak}x {current_side.upper()} IN A ROW* 🔥🔥\n\n"
-                    f"📊 History size: *{total} rounds*"
+                    f"🔥 *{current_streak}x {current_side.upper()} STREAK* 🔥\n\n"
+                    f"📊 Database: *{total} rounds*"
                 )
 
                 if settings["probability"]:
                     calc = advanced_calc(current_side, current_streak)
                     if calc:
-                        cont, brk, pressure, conf, score, matched, continued, total_calc = calc
+                        cont, brk, pressure, conf, score, matched, continued, _ = calc
                         broken = matched - continued
 
                         msg += (
-                            f"\n\n➡️ Continue: *{cont}%*\n"
-                            f"➡️ Break: *{brk}%*\n"
-                            f"📈 Pressure: *{pressure}×*\n"
-                            f"🎯 Confidence: *{conf}*\n"
-                            f"📊 Samples: *{matched}* ({continued} continue : {broken} break)"
+                            f"\n\n*📈 Probability Analysis:*\n"
+                            f"Continue: *{cont}%*\n"
+                            f"Break: *{brk}%*\n"
+                            f"Pressure: *{pressure}×*\n"
+                            f"Confidence: *{conf}* ({score}/100)\n"
+                            f"Sample: *{matched}* ({continued}✓ / {broken}✗)"
                         )
 
                 tg_send(msg)
@@ -408,24 +476,35 @@ async def monitor(page):
 
         except Exception as e:
             print("[MONITOR ERROR]", e)
-            await asyncio.sleep(5)
+            bot_status["running"] = False
+            await asyncio.sleep(10)
+            bot_status["running"] = True
 
 # =====================================================
 # ▶ RUN
 # =====================================================
 async def main():
-    # Start Flask health check server
+    # Start Flask FIRST
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print(f"[FLASK] Health check server started on port {os.getenv('PORT', 10000)}")
+    
+    # Wait for Flask to start
+    await asyncio.sleep(2)
+    print("[FLASK] Health server running")
 
-    tg_send("🚀 *Wingo Bot Started & Monitoring Live*")
+    try:
+        tg_send("🚀 *Wingo Bot Started*")
+    except Exception as e:
+        print(f"[TG] Initial message failed: {e}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
         page = await browser.new_page()
 
-        print("[SCRAPER] Opening page...")
+        print("[SCRAPER] Loading page...")
         await page.goto(WINGO_URL, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(8000)
 
@@ -437,4 +516,12 @@ async def main():
         )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[SHUTDOWN] Bot stopped by user")
+        bot_status["running"] = False
+    except Exception as e:
+        print(f"[FATAL ERROR] {e}")
+        bot_status["running"] = False
+        raise
