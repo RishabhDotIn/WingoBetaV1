@@ -5,6 +5,7 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
+from collections import defaultdict
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
@@ -13,7 +14,7 @@ from playwright.async_api import async_playwright
 from flask import Flask
 
 # =====================================================
-# 🌐 HEALTH CHECK SERVER (FOR RENDER)
+# 🌐 HEALTH CHECK SERVER
 # =====================================================
 app = Flask(__name__)
 bot_status = {"running": False, "last_update": None, "records": 0}
@@ -70,27 +71,31 @@ if not all([TG_TOKEN, ADMIN_CHAT_ID, MONGO_URI]):
     raise Exception("❌ Missing env variables")
 
 # =====================================================
-# ⚙️ CONFIG
+# ⚙️ CONFIG (OPTIMIZED FOR FREE TIER)
 # =====================================================
 WINGO_URL = "https://wingoanalyst.com/#/wingo_1m"
 CHECK_INTERVAL = 5
-MAX_RECORDS = 300
+MAX_RECORDS = 500  # Increased for better analysis
 MIN_DATA_FOR_CALC = 100
-MIN_MATCH_SAMPLE = 10
+MIN_MARKOV_DATA = 200  # Need more for Markov
+CACHE_DURATION = 300  # Cache calculations for 5 min
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
+# In-memory cache to reduce DB queries
+analysis_cache = {}
+last_cache_time = 0
+
 # =====================================================
-# 📤 TELEGRAM (MULTI-USER SUPPORT)
+# 📤 TELEGRAM (MULTI-USER)
 # =====================================================
 def tg_send(text, chat_id=None):
     """Send message to specific chat or all active users"""
     if chat_id:
-        # Send to specific user
         _send_to_chat(chat_id, text)
     else:
-        # Broadcast to all active users
-        active_users = users_col.find({"active": True})
+        # Broadcast to all active users (optimized query)
+        active_users = users_col.find({"active": True}, {"chat_id": 1})
         for user in active_users:
             _send_to_chat(user["chat_id"], text)
 
@@ -106,20 +111,24 @@ def _send_to_chat(chat_id, text):
             },
             timeout=10
         )
-        print(f"[TG] Message sent to {chat_id}")
+        print(f"[TG] ✓ {chat_id}")
     except Exception as e:
         print(f"[TG ERROR] {chat_id}: {e}")
 
 def is_admin(chat_id):
-    """Check if user is admin"""
     return str(chat_id) == str(ADMIN_CHAT_ID)
 
 # =====================================================
-# 🗄️ MONGODB
+# 🗄️ MONGODB (OPTIMIZED)
 # =====================================================
 print("[DB] Connecting to MongoDB...")
 try:
-    mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    mongo = MongoClient(
+        MONGO_URI, 
+        serverSelectionTimeoutMS=5000,
+        maxPoolSize=10,  # Limit connections for free tier
+        retryWrites=True
+    )
     mongo.admin.command('ping')
     print("[DB] Connected successfully")
 except Exception as e:
@@ -130,12 +139,16 @@ db = mongo["wingo_bot"]
 col = db["results"]
 settings_col = db["settings"]
 users_col = db["users"]
+predictions_col = db["predictions"]
 
+# Indexes
 col.create_index([("period", ASCENDING)], unique=True)
+col.create_index([("timestamp", -1)])  # For sorting
 users_col.create_index([("chat_id", ASCENDING)], unique=True)
+predictions_col.create_index([("timestamp", -1)])
 print("[DB] Indexes ensured")
 
-# Initialize admin user
+# Initialize admin
 if not users_col.find_one({"chat_id": ADMIN_CHAT_ID}):
     users_col.insert_one({
         "chat_id": ADMIN_CHAT_ID,
@@ -151,7 +164,8 @@ if not settings_col.find_one({"_id": "global"}):
     settings_col.insert_one({
         "_id": "global",
         "alerts": True,
-        "probability": True
+        "probability": True,
+        "advanced_mode": True
     })
     print("[DB] Default settings inserted")
 
@@ -162,203 +176,287 @@ def get_settings():
 # 🔄 DB HELPERS
 # =====================================================
 def trim_db():
+    """Trim old records (keeps last 500)"""
     count = col.count_documents({})
     if count > MAX_RECORDS:
         extra = count - MAX_RECORDS
-        old = col.find().sort("timestamp", 1).limit(extra)
-        col.delete_many({"_id": {"$in": [x["_id"] for x in old]}})
-        print(f"[DB] Trimmed {extra} old records")
+        old_ids = [x["_id"] for x in col.find({}, {"_id": 1}).sort("timestamp", 1).limit(extra)]
+        if old_ids:
+            col.delete_many({"_id": {"$in": old_ids}})
+            print(f"[DB] Trimmed {len(old_ids)} old records")
+    
+    # Trim old predictions (keep last 200)
+    pred_count = predictions_col.count_documents({})
+    if pred_count > 200:
+        extra = pred_count - 200
+        old_pred_ids = [x["_id"] for x in predictions_col.find({}, {"_id": 1}).sort("timestamp", 1).limit(extra)]
+        if old_pred_ids:
+            predictions_col.delete_many({"_id": {"$in": old_pred_ids}})
 
 # =====================================================
-# 🧮 ADVANCED CALCULATION
+# 🧮 OPTIMIZED ADVANCED CALCULATIONS
 # =====================================================
-def advanced_calc(target, streak_len):
-    data = list(col.find().sort("timestamp", 1))
+def get_cached_data():
+    """Get data with caching to reduce DB load"""
+    global analysis_cache, last_cache_time
+    
+    current_time = time.time()
+    if current_time - last_cache_time < CACHE_DURATION and analysis_cache:
+        return analysis_cache
+    
+    # Fetch only needed fields
+    data = list(col.find({}, {"result": 1, "timestamp": 1}).sort("timestamp", 1))
+    analysis_cache = data
+    last_cache_time = current_time
+    return data
+
+def build_markov_chain(results):
+    """Build Markov transition matrix"""
+    if len(results) < 50:
+        return None
+    
+    transitions = {"Big→Big": 0, "Big→Small": 0, "Small→Small": 0, "Small→Big": 0}
+    
+    for i in range(len(results) - 1):
+        key = f"{results[i]}→{results[i+1]}"
+        transitions[key] += 1
+    
+    big_total = transitions["Big→Big"] + transitions["Big→Small"]
+    small_total = transitions["Small→Small"] + transitions["Small→Big"]
+    
+    return {
+        "Big": {
+            "Big": transitions["Big→Big"] / big_total if big_total > 0 else 0.5,
+            "Small": transitions["Big→Small"] / big_total if big_total > 0 else 0.5
+        },
+        "Small": {
+            "Small": transitions["Small→Small"] / small_total if small_total > 0 else 0.5,
+            "Big": transitions["Small→Big"] / small_total if small_total > 0 else 0.5
+        }
+    }
+
+def analyze_time_patterns(data):
+    """Detect time-based biases (optimized)"""
+    if len(data) < 200:
+        return None
+    
+    hourly = defaultdict(lambda: {"Big": 0, "Small": 0})
+    
+    for record in data:
+        hour = record["timestamp"].hour
+        hourly[hour][record["result"]] += 1
+    
+    current_hour = datetime.now().hour
+    if current_hour in hourly:
+        counts = hourly[current_hour]
+        total = counts["Big"] + counts["Small"]
+        if total >= 10:
+            big_pct = counts["Big"] / total * 100
+            if abs(big_pct - 50) > 8:  # >8% deviation
+                return {
+                    "bias": "Big" if big_pct > 50 else "Small",
+                    "strength": abs(big_pct - 50)
+                }
+    return None
+
+def calculate_streak_decay(streak_len):
+    """Exponential decay for long streaks"""
+    if streak_len <= 3:
+        return 1.0
+    return 0.87 ** (streak_len - 3)
+
+def advanced_prediction(target, streak_len):
+    """Enhanced ensemble prediction model"""
+    data = get_cached_data()
     results = [x["result"] for x in data]
     total = len(results)
-
-    print(f"[PROB] Calculating for {streak_len}x {target}, data={total}")
-
+    
     if total < MIN_DATA_FOR_CALC:
         return None
-
+    
+    # 1. Base historical analysis
     matched = 0
     continued = 0
-
+    
     for i in range(len(results) - streak_len):
         window = results[i:i + streak_len]
         if all(x == target for x in window):
             matched += 1
             if i + streak_len < len(results) and results[i + streak_len] == target:
                 continued += 1
-
+    
     if matched == 0:
         return None
-
-    cont_pct = (continued / matched) * 100
-    brk_pct = 100 - cont_pct
-
+    
+    base_continue = (continued / matched) * 100
+    
+    # 2. Markov chain (if enough data)
+    markov_continue = None
+    if total >= MIN_MARKOV_DATA:
+        markov = build_markov_chain(results)
+        if markov:
+            markov_continue = markov[target][target] * 100
+    
+    # 3. Streak decay factor
+    decay = calculate_streak_decay(streak_len)
+    
+    # 4. Recent trend (last 30%)
+    recent_results = results[int(total * 0.7):]
+    recent_target_pct = (recent_results.count(target) / len(recent_results)) * 100
+    recent_multiplier = 1.0 + ((recent_target_pct - 50) / 100)
+    
+    # 5. Time pattern
+    time_pattern = analyze_time_patterns(data)
+    time_multiplier = 1.0
+    if time_pattern and time_pattern["bias"] == target:
+        time_multiplier = 1.0 + (time_pattern["strength"] / 200)
+    elif time_pattern:
+        time_multiplier = 1.0 - (time_pattern["strength"] / 200)
+    
+    # Ensemble calculation
+    if markov_continue is not None:
+        # Use all models
+        adjusted_continue = (
+            base_continue * 0.35 +        # Historical
+            markov_continue * 0.30 +      # Markov
+            (base_continue * decay) * 0.35 # Decay
+        ) * recent_multiplier * time_multiplier
+    else:
+        # Use limited models
+        adjusted_continue = (
+            base_continue * 0.50 +
+            (base_continue * decay) * 0.50
+        ) * recent_multiplier * time_multiplier
+    
+    # Cap probabilities
+    adjusted_continue = min(92, max(8, adjusted_continue))
+    adjusted_break = 100 - adjusted_continue
+    
+    # Calculate confidence
+    sample_strength = min(matched / 40, 1) * 25
+    bias_strength = abs(adjusted_continue - 50) * 0.6
+    decay_impact = (1 - decay) * 20
+    recent_impact = abs(recent_target_pct - 50) * 0.3
+    
+    confidence_score = sample_strength + bias_strength + decay_impact + recent_impact
+    
+    if confidence_score >= 70:
+        confidence = "🔥 Very High"
+    elif confidence_score >= 55:
+        confidence = "💪 High"
+    elif confidence_score >= 40:
+        confidence = "⚖️ Moderate"
+    else:
+        confidence = "⚠️ Low"
+    
+    # Calculate pressure
     streaks = []
-    cur = results[0]
-    cnt = 1
+    cur, cnt = results[0], 1
     for x in results[1:]:
         if x == cur:
             cnt += 1
         else:
             streaks.append(cnt)
-            cur = x
-            cnt = 1
+            cur, cnt = x, 1
     streaks.append(cnt)
-
     avg_streak = sum(streaks) / len(streaks)
     pressure = streak_len / avg_streak if avg_streak else 1
+    
+    return {
+        "continue": round(adjusted_continue, 2),
+        "break": round(adjusted_break, 2),
+        "confidence": confidence,
+        "score": round(confidence_score, 1),
+        "pressure": round(pressure, 2),
+        "matched": matched,
+        "continued": continued,
+        "models_used": 4 if markov_continue else 3,
+        "time_bias": time_pattern["bias"] if time_pattern else None
+    }
 
-    sample_strength = min(matched / 30, 1) * 30
-    bias_strength = abs(cont_pct - 50) * 0.6
-
-    if pressure < 0.8:
-        pressure_score = 20
-    elif pressure < 1.1:
-        pressure_score = 15
-    elif pressure < 1.4:
-        pressure_score = 10
-    else:
-        pressure_score = 5
-
-    recent_slice = results[int(total * 0.7):]
-    recent_matches = 0
-    recent_continues = 0
-
-    for i in range(len(recent_slice) - streak_len):
-        w = recent_slice[i:i + streak_len]
-        if all(x == target for x in w):
-            recent_matches += 1
-            if i + streak_len < len(recent_slice) and recent_slice[i + streak_len] == target:
-                recent_continues += 1
-
-    if recent_matches > 0:
-        recent_bias = abs((recent_continues / recent_matches) * 100 - 50)
-        recency_score = min(recent_bias * 0.4, 20)
-    else:
-        recency_score = 5
-
-    confidence_score = round(
-        sample_strength + bias_strength + pressure_score + recency_score, 1
-    )
-
-    if confidence_score >= 80:
-        confidence = "🔥 Very High"
-    elif confidence_score >= 60:
-        confidence = "💪 High"
-    elif confidence_score >= 40:
-        confidence = "⚖️ Moderate"
-    else:
-        confidence = "⚠️ Weak"
-
-    print(
-        f"[CONF] score={confidence_score} | "
-        f"sample={sample_strength:.1f} "
-        f"bias={bias_strength:.1f} "
-        f"pressure={pressure_score} "
-        f"recency={recency_score:.1f}"
-    )
-
-    return (
-        round(cont_pct, 2),
-        round(brk_pct, 2),
-        round(pressure, 2),
-        confidence,
-        confidence_score,
-        matched,
-        continued,
-        total
-    )
+def get_prediction_accuracy():
+    """Calculate recent prediction accuracy"""
+    recent = list(predictions_col.find().sort("timestamp", -1).limit(100))
+    
+    if len(recent) < 20:
+        return None
+    
+    correct = sum(1 for p in recent if p.get("correct", False))
+    accuracy = (correct / len(recent)) * 100
+    
+    return {
+        "accuracy": round(accuracy, 1),
+        "sample": len(recent),
+        "beating_random": accuracy > 52
+    }
 
 # =====================================================
 # 📥 SCRAPER HELPERS
 # =====================================================
 async def bootstrap_history(page):
-    """Load history only if DB is empty or has very few records"""
     existing_count = col.count_documents({})
     
     if existing_count >= 50:
-        print(f"[BOOTSTRAP] Skipping - DB already has {existing_count} records")
+        print(f"[BOOTSTRAP] Skipping - DB has {existing_count} records")
         return
     
-    print("[BOOTSTRAP] Loading history from page...")
-
-    rows = await page.query_selector_all(
-        "div[style*='display: flex'][style*='row']"
-    )
-
-    records = []
+    print("[BOOTSTRAP] Loading history...")
+    rows = await page.query_selector_all("div[style*='display: flex'][style*='row']")
+    
     inserted = 0
-    skipped = 0
-
     for r in rows:
         try:
             text = await r.inner_text()
             parts = [p.strip() for p in text.split("\n") if p.strip()]
             if len(parts) < 3:
                 continue
-
+            
             period = parts[0].replace("*", "")
             result = parts[2]
-
+            
             if result not in ("Big", "Small"):
                 continue
-
+            
             if col.find_one({"period": period}):
-                skipped += 1
                 continue
-
-            records.append({
-                "period": period,
-                "result": result,
-                "timestamp": datetime.now(timezone.utc)
-            })
-        except Exception as e:
-            print(f"[BOOTSTRAP ERROR] Row parse failed: {e}")
-
-    for record in records:
-        try:
-            col.insert_one(record)
-            inserted += 1
-        except DuplicateKeyError:
-            skipped += 1
+            
+            try:
+                col.insert_one({
+                    "period": period,
+                    "result": result,
+                    "timestamp": datetime.now(timezone.utc)
+                })
+                inserted += 1
+            except DuplicateKeyError:
+                continue
+        except:
             continue
-
-    print(f"[BOOTSTRAP] Complete: {inserted} inserted, {skipped} skipped")
+    
+    print(f"[BOOTSTRAP] Inserted {inserted} records")
 
 async def extract_latest(page):
-    rows = await page.query_selector_all(
-        "div[style*='display: flex'][style*='row']"
-    )
-
+    rows = await page.query_selector_all("div[style*='display: flex'][style*='row']")
+    
     for r in rows:
         try:
             text = await r.inner_text()
             parts = [p.strip() for p in text.split("\n") if p.strip()]
-            if len(parts) < 3:
-                continue
-
-            period = parts[0].replace("*", "")
-            result = parts[2]
-
-            if result in ("Big", "Small"):
-                return period, result
-        except Exception as e:
-            print(f"[SCRAPER ERROR] {e}")
+            if len(parts) >= 3:
+                period = parts[0].replace("*", "")
+                result = parts[2]
+                if result in ("Big", "Small"):
+                    return period, result
+        except:
             continue
-
     return None
 
 # =====================================================
-# 🤖 TELEGRAM COMMAND LISTENER
+# 🤖 TELEGRAM COMMANDS
 # =====================================================
 def command_listener():
     print("[TG] Command listener started")
     offset = 0
+    
     while True:
         try:
             r = requests.get(
@@ -366,225 +464,158 @@ def command_listener():
                 params={"offset": offset + 1, "timeout": 30},
                 timeout=35
             ).json()
-
+            
             for u in r.get("result", []):
                 offset = u["update_id"]
                 msg = u.get("message", {})
                 text = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
                 username = msg.get("chat", {}).get("username", "unknown")
-
+                
                 if not text or not chat_id:
                     continue
-
-                print(f"[TG CMD] {chat_id} ({username}): {text}")
-
-                # Register user automatically on first interaction
+                
+                print(f"[TG CMD] {chat_id}: {text}")
+                
+                # Auto-register
                 if not users_col.find_one({"chat_id": str(chat_id)}):
                     users_col.insert_one({
                         "chat_id": str(chat_id),
                         "username": username,
-                        "active": False,  # Must be added by admin
+                        "active": False,
                         "is_admin": False,
                         "added_at": datetime.now(timezone.utc)
                     })
-
-                # ============ ADMIN COMMANDS ============
                 
+                # ADMIN COMMANDS
                 if text.startswith("/adduser") and is_admin(chat_id):
                     parts = text.split()
                     if len(parts) != 2:
                         tg_send("❌ *Usage:* `/adduser {chat_id}`", chat_id)
                         continue
                     
-                    target_chat_id = parts[1]
-                    result = users_col.update_one(
-                        {"chat_id": target_chat_id},
-                        {
-                            "$set": {
-                                "active": True,
-                                "added_at": datetime.now(timezone.utc)
-                            }
-                        },
+                    target_id = parts[1]
+                    users_col.update_one(
+                        {"chat_id": target_id},
+                        {"$set": {"active": True, "added_at": datetime.now(timezone.utc)}},
                         upsert=True
                     )
-                    
-                    if result.modified_count > 0 or result.upserted_id:
-                        tg_send(
-                            f"✅ *𝗨𝘀𝗲𝗿 𝗔𝗱𝗱𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!*\n\n"
-                            f"👤 Chat ID: `{target_chat_id}`\n"
-                            f"📅 Added: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                            chat_id
-                        )
-                        tg_send(
-                            "🎉 *𝗪𝗲𝗹𝗰𝗼𝗺𝗲 𝘁𝗼 𝗪𝗶𝗻𝗴𝗼 𝗕𝗼𝘁!*\n\n"
-                            "✨ You've been added by admin\n"
-                            "🔔 You'll now receive streak alerts\n\n"
-                            "Type /help to see commands",
-                            target_chat_id
-                        )
-                    else:
-                        tg_send("⚠️ *User already active*", chat_id)
-
+                    tg_send(f"✅ *User Added*\n👤 `{target_id}`", chat_id)
+                    tg_send("🎉 *Welcome!*\n✨ You've been activated by admin\n\nType /help", target_id)
+                
                 elif text.startswith("/removeuser") and is_admin(chat_id):
                     parts = text.split()
-                    if len(parts) != 2:
-                        tg_send("❌ *Usage:* `/removeuser {chat_id}`", chat_id)
-                        continue
-                    
-                    target_chat_id = parts[1]
-                    users_col.update_one(
-                        {"chat_id": target_chat_id},
-                        {"$set": {"active": False}}
-                    )
-                    tg_send(
-                        f"🚫 *𝗨𝘀𝗲𝗿 𝗥𝗲𝗺𝗼𝘃𝗲𝗱*\n\n"
-                        f"👤 Chat ID: `{target_chat_id}`",
-                        chat_id
-                    )
-                    tg_send(
-                        "👋 *You've been removed from alerts*\n\n"
-                        "Contact admin to be re-added",
-                        target_chat_id
-                    )
-
+                    if len(parts) == 2:
+                        target_id = parts[1]
+                        users_col.update_one({"chat_id": target_id}, {"$set": {"active": False}})
+                        tg_send(f"🚫 *User Removed*\n👤 `{target_id}`", chat_id)
+                
                 elif text == "/listusers" and is_admin(chat_id):
-                    users = list(users_col.find({"active": True}))
+                    users = list(users_col.find({"active": True}, {"chat_id": 1, "username": 1, "is_admin": 1}))
                     if not users:
                         tg_send("📭 *No active users*", chat_id)
                     else:
-                        msg = "👥 *𝗔𝗖𝗧𝗜𝗩𝗘 𝗨𝗦𝗘𝗥𝗦*\n\n"
-                        for i, user in enumerate(users, 1):
-                            admin_badge = " 👑" if user.get("is_admin") else ""
-                            msg += f"{i}. `{user['chat_id']}`{admin_badge}\n"
-                            msg += f"   └ @{user.get('username', 'unknown')}\n\n"
-                        msg += f"📊 Total: *{len(users)} users*"
+                        msg = "👥 *ACTIVE USERS*\n\n"
+                        for i, u in enumerate(users, 1):
+                            badge = " 👑" if u.get("is_admin") else ""
+                            msg += f"{i}. `{u['chat_id']}`{badge}\n"
+                        msg += f"\n📊 Total: *{len(users)}*"
                         tg_send(msg, chat_id)
-
-                # ============ USER COMMANDS ============
                 
-                elif text == "/start":
-                    user = users_col.find_one({"chat_id": str(chat_id)})
-                    if user and user.get("active"):
+                elif text == "/accuracy" and is_admin(chat_id):
+                    acc = get_prediction_accuracy()
+                    if acc:
+                        status = "🎯 Beating Random!" if acc["beating_random"] else "📊 Learning..."
                         tg_send(
-                            "🎰 *𝗪𝗜𝗡𝗚𝗢 𝗕𝗢𝗧* 🎰\n\n"
-                            "✅ You're subscribed to alerts!\n\n"
-                            "📋 /help - View commands\n"
-                            "📊 /stats - View statistics\n"
-                            "⚙️ /settings - Bot settings",
+                            f"📈 *PREDICTION ACCURACY*\n\n"
+                            f"{status}\n"
+                            f"Accuracy: *{acc['accuracy']}%*\n"
+                            f"Sample: *{acc['sample']} predictions*",
                             chat_id
                         )
                     else:
-                        tg_send(
-                            "🎰 *𝗪𝗜𝗡𝗚𝗢 𝗕𝗢𝗧* 🎰\n\n"
-                            "⚠️ You're not authorized yet\n"
-                            "📩 Contact admin to get access\n\n"
-                            f"Your Chat ID: `{chat_id}`",
-                            chat_id
-                        )
-
-                elif text == "/help":
+                        tg_send("⏳ Need 20+ predictions first", chat_id)
+                
+                # USER COMMANDS
+                elif text == "/start":
                     user = users_col.find_one({"chat_id": str(chat_id)})
-                    msg = (
-                        "📚 *𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦*\n\n"
-                        "📊 /stats - Database statistics\n"
-                        "⚙️ /settings - View settings\n"
-                        "🔔 /alerts on|off - Toggle alerts\n"
-                        "📈 /probability on|off - Toggle probability\n"
-                        "ℹ️ /mychatid - Get your chat ID"
-                    )
+                    if user and user.get("active"):
+                        tg_send("🎰 *WINGO BOT* 🎰\n\n✅ Active\n\n/help - Commands", chat_id)
+                    else:
+                        tg_send(f"🎰 *WINGO BOT*\n\n⚠️ Not authorized\n\nYour ID: `{chat_id}`", chat_id)
+                
+                elif text == "/help":
+                    msg = "📚 *COMMANDS*\n\n/stats\n/settings\n/mychatid"
                     if is_admin(chat_id):
-                        msg += (
-                            "\n\n👑 *𝗔𝗗𝗠𝗜𝗡 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦*\n\n"
-                            "➕ /adduser {chat_id}\n"
-                            "➖ /removeuser {chat_id}\n"
-                            "👥 /listusers"
-                        )
+                        msg += "\n\n👑 *ADMIN*\n/adduser {id}\n/removeuser {id}\n/listusers\n/accuracy"
                     tg_send(msg, chat_id)
-
+                
                 elif text == "/stats":
                     count = col.count_documents({})
-                    total_users = users_col.count_documents({"active": True})
-                    tg_send(
-                        f"📊 *𝗗𝗔𝗧𝗔𝗕𝗔𝗦𝗘 𝗦𝗧𝗔𝗧𝗦*\n\n"
-                        f"🎲 Total Records: *{count}*\n"
-                        f"👥 Active Users: *{total_users}*\n"
-                        f"🤖 Status: *Online*",
-                        chat_id
-                    )
-
-                elif text == "/settings" or text == "/usersetting":
+                    users_count = users_col.count_documents({"active": True})
+                    acc = get_prediction_accuracy()
+                    
+                    msg = f"📊 *STATS*\n\n🎲 Records: *{count}*\n👥 Users: *{users_count}*"
+                    if acc:
+                        msg += f"\n🎯 Accuracy: *{acc['accuracy']}%*"
+                    tg_send(msg, chat_id)
+                
+                elif text == "/settings":
                     s = get_settings()
                     tg_send(
-                        f"⚙️ *𝗖𝗨𝗥𝗥𝗘𝗡𝗧 𝗦𝗘𝗧𝗧𝗜𝗡𝗚𝗦*\n\n"
-                        f"🔔 Alerts: *{'✅ ON' if s['alerts'] else '❌ OFF'}*\n"
-                        f"📈 Probability: *{'✅ ON' if s['probability'] else '❌ OFF'}*",
+                        f"⚙️ *SETTINGS*\n\n"
+                        f"🔔 Alerts: *{'ON' if s['alerts'] else 'OFF'}*\n"
+                        f"📈 Probability: *{'ON' if s['probability'] else 'OFF'}*\n"
+                        f"🧠 Advanced: *{'ON' if s.get('advanced_mode', True) else 'OFF'}*",
                         chat_id
                     )
-
+                
                 elif text == "/mychatid":
-                    tg_send(
-                        f"🆔 *𝗬𝗢𝗨𝗥 𝗖𝗛𝗔𝗧 𝗜𝗗*\n\n"
-                        f"`{chat_id}`\n\n"
-                        f"📋 Tap to copy",
-                        chat_id
-                    )
-
-                elif text.startswith("/alerts"):
-                    if not is_admin(chat_id):
-                        tg_send("⛔ *Admin only command*", chat_id)
-                        continue
-                    
-                    val = "on" in text.lower()
-                    settings_col.update_one({"_id": "global"}, {"$set": {"alerts": val}})
-                    tg_send(
-                        f"🔔 *𝗔𝗟𝗘𝗥𝗧𝗦*\n\n"
-                        f"Status: *{'✅ ENABLED' if val else '❌ DISABLED'}*",
-                        chat_id
-                    )
-
-                elif text.startswith("/probability"):
-                    if not is_admin(chat_id):
-                        tg_send("⛔ *Admin only command*", chat_id)
-                        continue
-                    
-                    val = "on" in text.lower()
-                    settings_col.update_one({"_id": "global"}, {"$set": {"probability": val}})
-                    tg_send(
-                        f"📈 *𝗣𝗥𝗢𝗕𝗔𝗕𝗜𝗟𝗜𝗧𝗬*\n\n"
-                        f"Status: *{'✅ ENABLED' if val else '❌ DISABLED'}*",
-                        chat_id
-                    )
-
+                    tg_send(f"🆔 *YOUR ID*\n\n`{chat_id}`\n\n📋 Tap to copy", chat_id)
+        
         except Exception as e:
             print(f"[TG CMD ERROR] {e}")
-
+        
         time.sleep(2)
 
 # =====================================================
 # 🚀 MAIN MONITOR
 # =====================================================
 async def monitor(page):
-    print("[MONITOR] Starting monitor loop")
+    print("[MONITOR] Starting...")
     bot_status["running"] = True
-
+    
     current_side = None
     current_streak = 0
     last_alerted_streak = 0
-
+    last_prediction = None
+    
     while True:
         try:
             res = await extract_latest(page)
             if not res:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
-
+            
             period, side = res
             
             if col.find_one({"period": period}):
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
-
+            
+            # Track prediction accuracy
+            if last_prediction:
+                was_correct = last_prediction["side"] == side
+                predictions_col.insert_one({
+                    "period": period,
+                    "predicted": last_prediction["side"],
+                    "actual": side,
+                    "correct": was_correct,
+                    "confidence": last_prediction.get("confidence", "Unknown"),
+                    "timestamp": datetime.now(timezone.utc)
+                })
+                last_prediction = None
+            
             try:
                 col.insert_one({
                     "period": period,
@@ -594,29 +625,35 @@ async def monitor(page):
                 bot_status["last_update"] = datetime.now(timezone.utc)
                 print(f"[DATA] {period} | {side}")
             except DuplicateKeyError:
-                print(f"[DATA] Duplicate skipped: {period}")
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
-
+            
             trim_db()
-
+            
+            # Invalidate cache
+            global last_cache_time
+            last_cache_time = 0
+            
             if side == current_side:
                 current_streak += 1
             else:
-                if current_streak >= 3:
+                if current_streak >= 3 and current_side is not None:
+                    prev_emoji = "🔴" if current_side == "Big" else "🔵"
+                    new_emoji = "🔵" if side == "Small" else "🔴"
                     tg_send(
-                        f"💔 *𝗦𝗧𝗥𝗘𝗔𝗞 𝗕𝗥𝗢𝗞𝗘𝗡*\n\n"
-                        f"{'🔴' if current_side == 'Big' else '🔵'} Previous: *{current_streak}x {current_side.upper()}*\n"
-                        f"{'🔵' if side == 'Small' else '🔴'} New: *{side.upper()}*\n\n"
+                        f"💔 *STREAK BROKEN* 💔\n\n"
+                        f"{prev_emoji} Was: *{current_streak}x {current_side.upper()}*\n"
+                        f"{new_emoji} Now: *{side.upper()}*\n\n"
                         f"⏱️ {datetime.now().strftime('%H:%M:%S')}"
                     )
-
+                
                 current_side = side
                 current_streak = 1
-
+                last_alerted_streak = 0
+            
             settings = get_settings()
             total = col.count_documents({})
-
+            
             if (current_streak >= 3 and 
                 current_streak > last_alerted_streak and 
                 settings["alerts"]):
@@ -625,43 +662,55 @@ async def monitor(page):
                 fire = "🔥" * min(current_streak, 5)
                 
                 msg = (
-                    f"{fire} *𝗦𝗧𝗥𝗘𝗔𝗞 𝗔𝗟𝗘𝗥𝗧* {fire}\n\n"
+                    f"{fire} *STREAK ALERT* {fire}\n\n"
                     f"{emoji} *{current_streak}x {current_side.upper()}* {emoji}\n\n"
                     f"━━━━━━━━━━━━━━━━\n"
-                    f"📊 Database: *{total} rounds*\n"
-                    f"⏱️ Time: *{datetime.now().strftime('%H:%M:%S')}*"
+                    f"📊 Records: *{total}*\n"
+                    f"⏱️ {datetime.now().strftime('%H:%M:%S')}"
                 )
-
-                if settings["probability"]:
-                    calc = advanced_calc(current_side, current_streak)
-                    if calc:
-                        cont, brk, pressure, conf, score, matched, continued, _ = calc
-                        broken = matched - continued
-
-                        # Progress bar for continue/break
-                        cont_bars = int(cont / 10)
-                        brk_bars = int(brk / 10)
-                        cont_visual = "█" * cont_bars + "░" * (10 - cont_bars)
-                        brk_visual = "█" * brk_bars + "░" * (10 - brk_bars)
-
+                
+                if settings["probability"] and total >= MIN_DATA_FOR_CALC:
+                    pred = advanced_prediction(current_side, current_streak)
+                    if pred:
+                        cont_bars = "█" * int(pred["continue"] / 10) + "░" * (10 - int(pred["continue"] / 10))
+                        brk_bars = "█" * int(pred["break"] / 10) + "░" * (10 - int(pred["break"] / 10))
+                        
                         msg += (
-                            f"\n\n📈 *𝗣𝗥𝗢𝗕𝗔𝗕𝗜𝗟𝗜𝗧𝗬 𝗔𝗡𝗔𝗟𝗬𝗦𝗜𝗦*\n"
+                            f"\n\n📈 *ADVANCED ANALYSIS*\n"
                             f"━━━━━━━━━━━━━━━━\n"
-                            f"✅ Continue: *{cont}%*\n"
-                            f"   {cont_visual}\n\n"
-                            f"❌ Break: *{brk}%*\n"
-                            f"   {brk_visual}\n\n"
-                            f"⚡ Pressure: *{pressure}×*\n"
-                            f"🎯 Confidence: *{conf}*\n"
-                            f"📊 Sample: *{matched}* (✓{continued} / ✗{broken})\n"
-                            f"💯 Score: *{score}/100*"
+                            f"✅ Continue: *{pred['continue']}%*\n"
+                            f"   {cont_bars}\n\n"
+                            f"❌ Break: *{pred['break']}%*\n"
+                            f"   {brk_bars}\n\n"
+                            f"⚡ Pressure: *{pred['pressure']}×*\n"
+                            f"🎯 Confidence: *{pred['confidence']}*\n"
+                            f"🧠 Models: *{pred['models_used']}*\n"
+                            f"💯 Score: *{pred['score']}/100*"
                         )
-
+                        
+                        if pred["time_bias"]:
+                            msg += f"\n⏰ Hour Bias: *{pred['time_bias']}*"
+                        
+                        # Store prediction
+                        predicted_side = current_side if pred["continue"] > pred["break"] else ("Small" if current_side == "Big" else "Big")
+                        last_prediction = {
+                            "side": predicted_side,
+                            "confidence": pred["confidence"]
+                        }
+                
+                elif total < MIN_DATA_FOR_CALC:
+                    msg += (
+                        f"\n\n⏳ *COLLECTING DATA*\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"📊 Progress: *{total}/{MIN_DATA_FOR_CALC}*\n"
+                        f"🔜 Advanced analysis soon!"
+                    )
+                
                 tg_send(msg)
                 last_alerted_streak = current_streak
-
+            
             await asyncio.sleep(CHECK_INTERVAL)
-
+        
         except Exception as e:
             print(f"[MONITOR ERROR] {e}")
             bot_status["running"] = False
@@ -674,34 +723,32 @@ async def monitor(page):
 async def main():
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    
     await asyncio.sleep(2)
-    print("[FLASK] Health server running")
-
+    
     try:
         tg_send(
-            "🚀 *𝗪𝗜𝗡𝗚𝗢 𝗕𝗢𝗧 𝗦𝗧𝗔𝗥𝗧𝗘𝗗* 🚀\n\n"
-            "✨ System online and monitoring\n"
-            "🔔 Alerts enabled\n"
-            "📊 Database connected\n\n"
-            f"⏱️ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            "🚀 *WINGO BOT v2.0* 🚀\n\n"
+            "✨ Advanced prediction online\n"
+            "🧠 Multi-model ensemble\n"
+            "📊 Accuracy tracking enabled\n\n"
+            f"⏱️ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
     except Exception as e:
-        print(f"[TG] Initial message failed: {e}")
-
+        print(f"[TG] Startup message failed: {e}")
+    
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox']
         )
         page = await browser.new_page()
-
+        
         print("[SCRAPER] Loading page...")
         await page.goto(WINGO_URL, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(8000)
-
+        
         await bootstrap_history(page)
-
+        
         await asyncio.gather(
             monitor(page),
             asyncio.to_thread(command_listener)
@@ -711,7 +758,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Bot stopped by user")
+        print("\n[SHUTDOWN] Bot stopped")
         bot_status["running"] = False
     except Exception as e:
         print(f"[FATAL ERROR] {e}")
