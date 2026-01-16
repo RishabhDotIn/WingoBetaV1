@@ -61,10 +61,10 @@ if not all([TG_TOKEN, ADMIN_CHAT_ID, MONGO_URI]):
 # =====================================================
 WINGO_URL = "https://wingoanalyst.com/#/wingo_1m"
 CHECK_INTERVAL = 5
-MAX_RECORDS = 800
+MAX_RECORDS = 1000  # Increased for better analysis
 MAX_PREDICTIONS = 500  # Store last 500 predictions
-MIN_DATA_FOR_CALC = 150
-MIN_CONFIDENCE_TO_ALERT = 65  # Only send bet alerts if confidence >= 65%
+MIN_DATA_FOR_CALC = 100  # Lowered to start predicting sooner
+MIN_CONFIDENCE_TO_ALERT = 55  # Lowered to 55 so it actually sends predictions
 CACHE_DURATION = 300
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
@@ -254,7 +254,7 @@ def pattern_frequency_analysis(results, pattern_length=3):
     return pattern_probs
 
 def advanced_prediction_v2(target, streak_len, results):
-    """Significantly improved prediction algorithm"""
+    """Significantly improved prediction algorithm - MORE AGGRESSIVE"""
     total = len(results)
     
     if total < MIN_DATA_FOR_CALC:
@@ -280,71 +280,81 @@ def advanced_prediction_v2(target, streak_len, results):
     
     if recent_pattern in pattern_probs:
         pattern_data = pattern_probs[recent_pattern]
-        if pattern_data["sample"] >= 8:
+        if pattern_data["sample"] >= 5:  # Lowered threshold
             expected_continue = pattern_data[target]
-            pattern_boost = (expected_continue - 50) * 0.4  # Weight pattern signal
+            pattern_boost = (expected_continue - 50) * 0.6  # Increased weight
     
     # 3. Manipulation detection
     manipulation = detect_manipulation(results)
     
-    # 4. Recent momentum (last 20%)
-    recent_results = results[int(total * 0.8):]
+    # 4. Recent momentum (last 25%)
+    recent_results = results[int(total * 0.75):]
     recent_target_count = recent_results.count(target)
     recent_momentum = (recent_target_count / len(recent_results)) * 100
-    momentum_factor = 1.0 + ((recent_momentum - 50) / 150)
+    momentum_boost = (recent_momentum - 50) * 0.5  # Direct boost
     
-    # 5. Streak decay (longer = less likely to continue)
+    # 5. Streak decay (adjusted to be less aggressive)
     if streak_len <= 2:
         decay = 1.0
     elif streak_len == 3:
-        decay = 0.92
+        decay = 0.95  # Less penalty
     elif streak_len == 4:
-        decay = 0.84
+        decay = 0.90
     elif streak_len == 5:
+        decay = 0.82
+    elif streak_len == 6:
         decay = 0.75
     else:
-        decay = 0.7 ** (streak_len - 5)
+        decay = 0.72 ** (streak_len - 6)
     
-    # 6. Anti-manipulation logic
+    # 6. Anti-manipulation logic (less aggressive)
     if manipulation["rigged"]:
-        # If rigged, use inverse psychology
-        trap_points = {3: -10, 5: -15, 7: -20}  # Negative = less likely to continue
+        trap_points = {3: -5, 5: -8, 7: -12}  # Reduced penalties
         trap_penalty = trap_points.get(streak_len, 0)
         
-        # Long streaks = crowd chases = house breaks
         if streak_len >= 4:
-            manipulation_penalty = -8 * (streak_len - 3)
+            manipulation_penalty = -5 * (streak_len - 3)  # Reduced
         else:
             manipulation_penalty = 0
     else:
         trap_penalty = 0
         manipulation_penalty = 0
     
-    # 7. Combine all factors
+    # 7. Combine all factors (more aggressive)
     adjusted_continue = (
-        base_continue * decay * momentum_factor +
-        pattern_boost +
-        manipulation_penalty +
+        base_continue * 0.5 +           # Base weight
+        base_continue * decay * 0.3 +   # Decay component
+        pattern_boost +                 # Pattern signal
+        momentum_boost +                # Momentum signal
+        manipulation_penalty +          # Rigging adjustment
         trap_penalty
     )
     
-    # Cap between 5-95%
-    adjusted_continue = min(95, max(5, adjusted_continue))
+    # Cap between 15-85% (wider range)
+    adjusted_continue = min(85, max(15, adjusted_continue))
     adjusted_break = 100 - adjusted_continue
     
-    # 8. Calculate confidence
-    sample_quality = min(matched / 50, 1) * 30
-    deviation_strength = abs(adjusted_continue - 50) * 0.7
-    pattern_confidence = min(pattern_boost, 15) if pattern_boost > 0 else 0
-    manipulation_clarity = manipulation["score"] * 0.15 if manipulation["rigged"] else 0
+    # 8. Calculate confidence (MORE GENEROUS)
+    sample_quality = min(matched / 30, 1) * 25  # Easier to get points
+    deviation_strength = abs(adjusted_continue - 50) * 0.9  # More weight to deviation
+    pattern_confidence = abs(pattern_boost) * 0.8 if pattern_boost != 0 else 0
+    momentum_confidence = abs(momentum_boost) * 0.6
+    manipulation_clarity = manipulation["score"] * 0.2 if manipulation["rigged"] else 10  # Bonus if rigged
     
-    confidence_score = sample_quality + deviation_strength + pattern_confidence + manipulation_clarity
+    confidence_score = (
+        sample_quality + 
+        deviation_strength + 
+        pattern_confidence + 
+        momentum_confidence + 
+        manipulation_clarity
+    )
     
-    if confidence_score >= 75:
+    # More lenient confidence levels
+    if confidence_score >= 70:
         confidence = "🔥 Very High"
-    elif confidence_score >= 62:
+    elif confidence_score >= 55:
         confidence = "💪 High"
-    elif confidence_score >= 48:
+    elif confidence_score >= 40:
         confidence = "⚖️ Moderate"
     else:
         confidence = "⚠️ Low"
@@ -367,8 +377,11 @@ def advanced_prediction_v2(target, streak_len, results):
         "recommendation": recommendation,
         "rec_probability": round(rec_probability, 1),
         "manipulation_detected": manipulation["rigged"],
-        "should_alert": confidence_score >= MIN_CONFIDENCE_TO_ALERT
+        "should_alert": confidence_score >= MIN_CONFIDENCE_TO_ALERT,  # More alerts
+        "pattern_boost": round(pattern_boost, 1),
+        "momentum_boost": round(momentum_boost, 1)
     }
+
 
 def get_prediction_accuracy(limit=100):
     """Get accuracy for last N predictions"""
@@ -536,6 +549,17 @@ def command_listener():
                     
                     tg_send(msg if acc_100 else "⏳ Need 10+ predictions", chat_id)
                 
+                elif text == "/resetpredictions" and is_admin(chat_id):
+                    count = predictions_col.count_documents({})
+                    predictions_col.delete_many({})
+                    tg_send(
+                        f"🗑️ *PREDICTIONS RESET*\n\n"
+                        f"Deleted: *{count} predictions*\n"
+                        f"Fresh start enabled!",
+                        chat_id
+                    )
+                    print(f"[ADMIN] Reset {count} predictions")
+                
                 # USER
                 elif text == "/start":
                     user = users_col.find_one({"chat_id": str(chat_id)})
@@ -547,7 +571,7 @@ def command_listener():
                 elif text == "/help":
                     msg = "📚 *COMMANDS*\n\n/stats\n/mychatid"
                     if is_admin(chat_id):
-                        msg += "\n\n👑 *ADMIN*\n/adduser {id}\n/removeuser {id}\n/listusers\n/accuracy"
+                        msg += "\n\n👑 *ADMIN*\n/adduser {id}\n/removeuser {id}\n/listusers\n/accuracy\n/resetpredictions"
                     tg_send(msg, chat_id)
                 
                 elif text == "/stats":
@@ -672,10 +696,15 @@ async def monitor(page):
                             f"💯 Score: *{pred['score']}/100*"
                         )
                         
-                        if pred["manipulation_detected"]:
-                            msg += "\n⚠️ Manipulation detected"
+                        # Show debug info
+                        if pred.get("pattern_boost") or pred.get("momentum_boost"):
+                            msg += f"\n📊 Pattern: *{pred.get('pattern_boost', 0)}*"
+                            msg += f"\n🔄 Momentum: *{pred.get('momentum_boost', 0)}*"
                         
-                        # BET ALERT
+                        if pred["manipulation_detected"]:
+                            msg += "\n⚠️ Rigged detected"
+                        
+                        # BET ALERT - Now triggers more often
                         if pred["should_alert"] and settings.get("bet_alerts", True):
                             bet_emoji = "🔴" if pred["recommendation"] == "Big" else "🔵"
                             msg += (
@@ -692,6 +721,9 @@ async def monitor(page):
                                 "confidence": pred["confidence"],
                                 "probability": pred["rec_probability"]
                             }
+                        else:
+                            # Show why no bet alert
+                            msg += f"\n\n⏳ Score too low for bet ({pred['score']}/{MIN_CONFIDENCE_TO_ALERT})"
                 
                 else:
                     msg += f"\n\n⏳ *COLLECTING*\n{total}/{MIN_DATA_FOR_CALC}"
@@ -748,4 +780,3 @@ if __name__ == "__main__":
         print("\n[STOP]")
     except Exception as e:
         print(f"[FATAL] {e}")
-        
